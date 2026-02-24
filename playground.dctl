@@ -4,6 +4,7 @@ DEFINE_UI_PARAMS(p_Lift, Lift, DCTLUI_SLIDER_FLOAT, 0.0f, -1.0f, 1.0f, 0.001f)
 DEFINE_UI_PARAMS(p_Gamma, Gamma, DCTLUI_SLIDER_FLOAT, 0.0f, -1.0f, 1.0f, 0.001f)
 DEFINE_UI_PARAMS(p_Gain, Gain, DCTLUI_SLIDER_FLOAT, 1.0f, 0.0f, 2.0f, 0.001f)
 DEFINE_UI_PARAMS(p_Offset, Offset, DCTLUI_SLIDER_FLOAT, 0.0f, -1.0f, 1.0f, 0.001f)
+DEFINE_UI_PARAMS(p_SubSat, Sub. Saturation, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.001)
 
 DEFINE_UI_PARAMS(p_Ramp, 💩 Ramp, DCTLUI_CHECK_BOX, 0)
 
@@ -97,7 +98,41 @@ __DEVICE__ float3 applyOffsetF3(float3 in, float offset) {
     return out;
 }
 
-__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B) {    
+// Subtractive Saturation via Tetra (Hexadecant) Model
+// Each hexadecant identifies the minimum channel (achromatic component),
+// then scales the chromatic content by (1 - sat) toward that neutral.
+__DEVICE__ float3 applyTetraSubSat(float p_R, float p_G, float p_B, float sat) {
+    float3 Color;
+    float sf = 1.0f - sat;
+
+    if (p_R > p_G) {
+        if (p_G > p_B) {
+            // Red-Yellow: min = B
+            Color = make_float3(p_B + sf * (p_R - p_B), p_B + sf * (p_G - p_B), p_B);
+        } else if (p_R > p_B) {
+            // Red-Magenta: min = G
+            Color = make_float3(p_G + sf * (p_R - p_G), p_G, p_G + sf * (p_B - p_G));
+        } else {
+            // Blue-Magenta: min = G
+            Color = make_float3(p_G + sf * (p_R - p_G), p_G, p_G + sf * (p_B - p_G));
+        }
+    } else {
+        if (p_B > p_G) {
+            // Blue-Cyan: min = R
+            Color = make_float3(p_R, p_R + sf * (p_G - p_R), p_R + sf * (p_B - p_R));
+        } else if (p_B > p_R) {
+            // Green-Cyan: min = R
+            Color = make_float3(p_R, p_R + sf * (p_G - p_R), p_R + sf * (p_B - p_R));
+        } else {
+            // Green-Yellow: min = B
+            Color = make_float3(p_B + sf * (p_R - p_B), p_B + sf * (p_G - p_B), p_B);
+        }
+    }
+
+    return Color;
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B) {
     float3 in_RGB = make_float3(p_R, p_G, p_B);
     float3 out = in_RGB;
 
@@ -128,6 +163,9 @@ __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p
     out = applyLiftF3(out, p_Lift);
     out = applyGainF3(out, p_Gain);
     out = applyOffsetF3(out, p_Offset);
+
+    // Subtractive Saturation (Tetra Model)
+    out = applyTetraSubSat(out.x, out.y, out.z, p_SubSat);
 
     return out;
 }
