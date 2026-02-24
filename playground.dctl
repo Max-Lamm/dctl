@@ -6,6 +6,14 @@ DEFINE_UI_PARAMS(p_Gain, Gain, DCTLUI_SLIDER_FLOAT, 1.0f, 0.0f, 2.0f, 0.001f)
 DEFINE_UI_PARAMS(p_Offset, Offset, DCTLUI_SLIDER_FLOAT, 0.0f, -1.0f, 1.0f, 0.001f)
 DEFINE_UI_PARAMS(p_SubSat, Sub. Saturation, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.001)
 
+DEFINE_UI_PARAMS(p_Den, Film Density, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 2.0, 0.001)
+DEFINE_UI_PARAMS(p_WR, Red Weight, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.001)
+DEFINE_UI_PARAMS(p_WG, Green Weight, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.001)
+DEFINE_UI_PARAMS(p_WB, Blue Weight, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.001)
+DEFINE_UI_PARAMS(p_LimitS, Low Sat Limiter, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.001)
+DEFINE_UI_PARAMS(p_LimitL, Low Luma Limiter, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.001)
+DEFINE_UI_PARAMS(p_Display, Display Alpha, DCTLUI_CHECK_BOX, 0)
+
 DEFINE_UI_PARAMS(p_Ramp, 💩 Ramp, DCTLUI_CHECK_BOX, 0)
 
 // Transfer Functions
@@ -132,6 +140,112 @@ __DEVICE__ float3 applyTetraSubSat(float p_R, float p_G, float p_B, float sat) {
     return Color;
 }
 
+// Film Density Helpers
+#if (__RESOLVE_VER_MAJOR__ < 17)
+__DEVICE__ float _floorf(float A) { return (float)_floor(A); }
+#endif
+
+__DEVICE__ float3 RGB_to_HSV(float3 RGB) {
+    float3 HSV;
+    float mn  = _fminf(_fminf(RGB.x, RGB.y), RGB.z);
+    float mx  = _fmaxf(_fmaxf(RGB.x, RGB.y), RGB.z);
+    HSV.z = mx;
+    float delta = mx - mn;
+    if (mx != 0.0f) {
+        HSV.y = delta / mx;
+    } else {
+        HSV.y = 0.0f; HSV.x = 0.0f;
+        return HSV;
+    }
+    if (delta == 0.0f) {
+        HSV.x = 0.0f;
+    } else if (RGB.x == mx) {
+        HSV.x = (RGB.y - RGB.z) / delta;
+    } else if (RGB.y == mx) {
+        HSV.x = 2.0f + (RGB.z - RGB.x) / delta;
+    } else {
+        HSV.x = 4.0f + (RGB.x - RGB.y) / delta;
+    }
+    HSV.x *= 1.0f / 6.0f;
+    if (HSV.x < 0.0f) HSV.x += 1.0f;
+    return HSV;
+}
+
+__DEVICE__ float3 HSV_to_RGB(float3 HSV) {
+    float3 RGB;
+    if (HSV.y == 0.0f) {
+        RGB.x = RGB.y = RGB.z = HSV.z;
+    } else {
+        HSV.x *= 6.0f;
+        float i = _floorf(HSV.x);
+        float f = HSV.x - i;
+        i = i >= 0.0f ? _fmod(i, 6.0f) : _fmod(i, 6.0f) + 6.0f;
+        float p = HSV.z * (1.0f - HSV.y);
+        float q = HSV.z * (1.0f - HSV.y * f);
+        float t = HSV.z * (1.0f - HSV.y * (1.0f - f));
+        RGB.x = i == 0.0f ? HSV.z : i == 1.0f ? q : i == 2.0f ? p : i == 3.0f ? p : i == 4.0f ? t : HSV.z;
+        RGB.y = i == 0.0f ? t : i == 1.0f ? HSV.z : i == 2.0f ? HSV.z : i == 3.0f ? q : i == 4.0f ? p : p;
+        RGB.z = i == 0.0f ? p : i == 1.0f ? p : i == 2.0f ? t : i == 3.0f ? HSV.z : i == 4.0f ? HSV.z : q;
+    }
+    return RGB;
+}
+
+__DEVICE__ float RGB_to_Sat(float3 RGB) {
+    float mn = _fminf(_fminf(RGB.x, RGB.y), RGB.z);
+    float mx = _fmaxf(_fmaxf(RGB.x, RGB.y), RGB.z);
+    return mx != 0.0f ? (mx - mn) / mx : 0.0f;
+}
+
+__DEVICE__ float3 DenSaturation(float3 RGB, float luma, float Sat) {
+    RGB.x = (1.0f - Sat) * luma + RGB.x * Sat;
+    RGB.y = (1.0f - Sat) * luma + RGB.y * Sat;
+    RGB.z = (1.0f - Sat) * luma + RGB.z * Sat;
+    return RGB;
+}
+
+__DEVICE__ float get_luma(float3 RGB, float Rw, float Gw, float Bw) {
+    float R = Rw + 1.0f - (Gw / 2.0f) - (Bw / 2.0f);
+    float G = Gw + 1.0f - (Rw / 2.0f) - (Bw / 2.0f);
+    float B = Bw + 1.0f - (Rw / 2.0f) - (Gw / 2.0f);
+    return (RGB.x * R + RGB.y * G + RGB.z * B) / 3.0f;
+}
+
+__DEVICE__ float DenLimiter(float val, float limiter) {
+    float alpha;
+    if (limiter > 1.0f) {
+        alpha = val + (1.0f - limiter) * (1.0f - val);
+    } else if (limiter >= 0.0f) {
+        alpha = val >= limiter ? 1.0f : val / limiter;
+    } else if (limiter < -1.0f) {
+        alpha = (1.0f - val) + (limiter + 1.0f) * val;
+    } else {
+        alpha = val <= (1.0f + limiter) ? 1.0f : (1.0f - val) / (1.0f - (limiter + 1.0f));
+    }
+    return _saturatef(alpha);
+}
+
+__DEVICE__ float3 applyFilmDensity(float3 rgbIn, float den, float wR, float wG, float wB,
+                                    float limitS, float limitL, int display) {
+    if (den == 0.0f && display == 0) return rgbIn;
+
+    float WR = 2.0f - wR, WG = 2.0f - wG, WB = 2.0f - wB;
+    float luma = get_luma(rgbIn, WR, WG, WB);
+    float SatA = 1.0f / (den + 1.0f);
+    float3 rgbOut = DenSaturation(rgbIn, luma, SatA);
+
+    float alpha = 1.0f;
+    if (limitS > 0.0f) alpha  = DenLimiter(RGB_to_Sat(rgbIn), limitS);
+    if (limitL > 0.0f) alpha *= DenLimiter((rgbIn.x + rgbIn.y + rgbIn.z) / 3.0f, limitL);
+
+    rgbOut = RGB_to_HSV(rgbOut);
+    rgbOut.y *= 1.0f / SatA;
+    rgbOut = HSV_to_RGB(rgbOut);
+
+    if (alpha < 1.0f) rgbOut = rgbOut * alpha + (1.0f - alpha) * rgbIn;
+    if (display)      return make_float3(alpha, alpha, alpha);
+    return rgbOut;
+}
+
 __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B) {
     float3 in_RGB = make_float3(p_R, p_G, p_B);
     float3 out = in_RGB;
@@ -166,6 +280,9 @@ __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p
 
     // Subtractive Saturation (Tetra Model)
     out = applyTetraSubSat(out.x, out.y, out.z, p_SubSat);
+
+    // Film Density
+    out = applyFilmDensity(out, p_Den, p_WR, p_WG, p_WB, p_LimitS, p_LimitL, p_Display);
 
     return out;
 }
