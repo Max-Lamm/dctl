@@ -2,31 +2,29 @@
 
 **Advanced Saturation Control DCTL for DaVinci Resolve**
 
-A precision saturation tool built for colorists who need more control than Resolve's built-in saturation offers. MonacoSat separates saturation adjustments by luminance zone, lets you choose between additive and subtractive saturation behavior, and includes a limiter to protect specific saturation ranges from being pushed too far.
-
-![Maximilian Lamm](https://maxlamm.com)
+A precision saturation tool built for colorists who need more control than Resolve's built-in saturation offers. maxlammSat uses RGB luma-based saturation (not HSV) for natural, artifact-free results, with luminance zone targeting, a saturation limiter, additive/subtractive mix control, and gamut-aware soft clipping.
 
 ---
 
 ## Features
 
-- **Multiplicative Gain** – scale saturation from 0 (fully desat) through 1 (neutral) to 2 (double)
-- **Luminance Zone Control** (Low / Mid / High) – target saturation changes to shadows, midtones, or highlights
-- **Sat Limiter** – protect already-saturated or near-neutral areas from over-processing
-- **Sat Mix** – blend between subtractive (proportional) and additive (uniform) saturation behavior
-- **Soft Clamp** – saturation rolls off smoothly above 75%, preventing hard clipping or oversaturation
-- **HSV+RGB Hybrid** – automatic counter-desaturation in RGB space tames neon/plastic artifacts from HSV boosts
-- **Show Curve** – real-time overlay showing the saturation transfer function with soft clamp threshold
+- **RGB Luma-Based Saturation** – `out = luma + (in - luma) × factor` preserves hue and avoids HSV neon artifacts
+- **Multiplicative Gain** – scale from 0 (monochrome) through 1 (neutral) to 2 (double saturation)
+- **Luminance Zone Control** (Low / Mid / High) – target saturation to shadows, midtones, or highlights
+- **Sat Limiter** – protect high-saturation or low-saturation areas from over-processing
+- **Sat Mix** – blend between subtractive (proportional) and additive (uniform) zone behavior
+- **Gamut-Aware Soft Clamp** – per-channel roll-off prevents clipping while preserving hue
+- **Show Curve** – real-time saturation transfer overlay with zone curves
 
 ## Parameters
 
 | Slider | Range | Default | Description |
 |---|---|---|---|
-| **Gain** | 0.0 … 2.0 | 1.0 | Multiplicative global saturation. 1 = no change |
-| **Low** | -1 … +1 | 0.0 | Additive saturation adjustment in shadows |
-| **Mid** | -1 … +1 | 0.0 | Additive saturation adjustment in midtones |
-| **High** | -1 … +1 | 0.0 | Additive saturation adjustment in highlights |
-| **Sat Limiter** | -1 … +1 | 0.0 | Neg: attenuate on high-sat pixels. Pos: attenuate on low-sat pixels |
+| **Gain** | 0.0 … 2.0 | 1.0 | Multiplicative saturation. 0 = mono, 1 = neutral, 2 = double |
+| **Low** | -1 … +1 | 0.0 | Saturation offset in shadows |
+| **Mid** | -1 … +1 | 0.0 | Saturation offset in midtones |
+| **High** | -1 … +1 | 0.0 | Saturation offset in highlights |
+| **Sat Limiter** | -1 … +1 | 0.0 | Neg: protect saturated pixels. Pos: protect neutral pixels |
 | **Sat Mix** | -1 … +1 | 0.0 | -1 = subtractive, 0 = balanced, +1 = additive |
 | **Show Curve** | on/off | off | Saturation transfer curve overlay |
 | **Show Masks** | on/off | off | *Reserved* |
@@ -38,39 +36,31 @@ A precision saturation tool built for colorists who need more control than Resol
 ```
 Input RGB
   │
-  ├── RGB → HSV
+  ├── Compute Rec.709 luminance
+  ├── Measure pixel saturation (RGB distance from neutral)
   │
-  ├── Gain (multiplicative: sat × gain)
+  ├── Gain (multiplicative base factor)
   │
-  ├── Zone adjustment (Low/Mid/High weighted by Rec.709 luma)
-  │     └── modulated by Sat Limiter
-  │     └── blended via Sat Mix (additive ↔ subtractive)
+  ├── Zone adjustment (Low/Mid/High weighted by luma)
+  │     ├── modulated by Sat Limiter
+  │     └── blended via Sat Mix
   │
-  ├── Soft Clamp (shoulder curve above 75%)
+  ├── Apply: out = luma + (in - luma) × factor
   │
-  ├── HSV → RGB
-  │
-  ├── RGB counter-desaturation (proportional to boost amount)
-  │     └── blends toward luma-neutral to tame HSV artifacts
+  ├── Gamut-aware soft clamp (per-channel roll-off)
   │
   └── Output RGB
 ```
 
+## Why RGB Luma-Based (Not HSV)
+
+HSV saturation treats all channels uniformly, which leads to neon/plastic artifacts on saturated colors and discontinuities at hue boundaries. RGB luma-based saturation scales the distance of each channel from the luminance neutral point, which preserves the perceptual color balance and produces results identical to how professional color tools like Resolve's own saturation work internally.
+
+At Gain = 0, you get exact Rec.709 luminance (pure monochrome). At Gain = 2, color distances from neutral are doubled proportionally. No hue shift, no artifacts.
+
 ## Soft Clamp
 
-Saturation values are free to move in the 0–75% range. Above 75%, a hyperbolic shoulder curve rolls values off smoothly toward 100% without ever exceeding it. This prevents color clipping and maintains natural-looking results even with aggressive settings.
-
-## HSV+RGB Hybrid
-
-Pure HSV saturation boosts tend to produce neon/plastic-looking colors because HSV treats all channels uniformly. MonacoSat automatically applies a subtle counter-desaturation in RGB space (weighted by Rec.709 luminance) proportional to the saturation boost. This happens invisibly — the user controls a single Gain slider while the hybrid blend works in the background.
-
-The counter-desaturation strength is currently set to 30% of the HSV delta. It only activates when saturation is *increased* (never when desaturating).
-
-## How Sat Mix Works
-
-- **Subtractive (−1):** `new_sat = sat × (1 + adj)` — proportional, preserves color relationships
-- **Additive (+1):** `new_sat = sat + adj` — uniform shift, can push neutrals into color
-- **Balanced (0):** 50/50 blend
+Instead of clamping abstract saturation values, maxlammSat operates gamut-aware: it computes per-channel headroom (how far each RGB channel can go before hitting 0 or 1), then applies a hyperbolic shoulder when the saturation factor approaches that limit. This means colors roll off smoothly toward the gamut boundary without hard clipping, and the hue is preserved throughout the roll-off.
 
 ## Luminance Zones
 
@@ -87,14 +77,14 @@ High  ░░░░░░░░░░░░████████  peaks at 1.0
 When **Show Curve** is enabled:
 
 - **Orange** — main transfer curve (midtone luminance)
-- **Blue** — low zone curve (visible when Low slider is active)
-- **Red** — high zone curve (visible when High slider is active)
-- **Diagonal** — identity reference (no change)
-- **Dark red horizontal line** — soft clamp threshold at 75%
+- **Blue** — low zone curve (visible when Low is active)
+- **Red** — high zone curve (visible when High is active)
+- **Diagonal** — identity (no change)
+- **Dark red line** — soft clamp threshold at 75%
 
 ## Installation
 
-1. Copy `MonacoSat.dctl` into your DaVinci Resolve DCTL directory:
+1. Copy `maxlammSat.dctl` into your DaVinci Resolve DCTL directory:
    - **macOS:** `/Library/Application Support/Blackmagic Design/DaVinci Resolve/LUT/DCTL/`
    - **Windows:** `C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\LUT\DCTL\`
    - **Linux:** `/opt/resolve/LUT/DCTL/` or `~/.local/share/DaVinciResolve/LUT/DCTL/`
@@ -103,18 +93,17 @@ When **Show Curve** is enabled:
 
 ## Roadmap
 
-- [ ] Hue Mask – isolate saturation changes to specific hue ranges
+- [ ] Hue Mask – isolate changes to specific hue ranges
 - [ ] Luma Mask – soft luminance masking with adjustable falloff
-- [ ] Show Masks – visual overlay for active mask regions
-- [ ] Configurable RGB counter-strength slider (currently fixed at 30%)
+- [ ] Show Masks – visual overlay for active masks
 
 ## Technical Details
 
-- **Saturation model:** HSV with automatic RGB counter-desaturation
-- **Zone weighting:** Rec.709 luminance (`0.2126R + 0.7152G + 0.0722B`)
-- **Soft clamp:** Hyperbolic shoulder `f(x) = 0.75 + 0.25 × (x-0.75) / (x-0.75 + 0.25)`
-- **Transitions:** Smoothstep-based zone blending
+- **Saturation model:** RGB luma-based (`out = luma + (in - luma) × factor`)
+- **Luminance:** Rec.709 (`0.2126R + 0.7152G + 0.0722B`)
+- **Soft clamp:** Per-channel gamut-aware hyperbolic shoulder
+- **Zone transitions:** Smoothstep blending
 
 ---
 
-*maxlamm © 2026*
+*Maximilian Lamm © 2026*
