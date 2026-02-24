@@ -185,7 +185,7 @@ __DEVICE__ float computeOutputSatForCurve(
         sat_limiter, sat_mix
     );
     float outSat = inputSat * factor;
-    return softClamp(_fmaxf(outSat, 0.0f));
+    return _fmaxf(outSat, 0.0f);
 }
 
 
@@ -232,13 +232,6 @@ __DEVICE__ float3 drawCurveOverlay(
     int diagY = gy0 + (int)((1.0f - nx) * gs);
     if (_fabs((float)(y - diagY)) < 1.0f) {
         color.x = 0.22f; color.y = 0.22f; color.z = 0.22f;
-        return color;
-    }
-
-    // Soft clamp threshold line
-    int clipLineY = gy0 + (int)((1.0f - SOFT_CLIP_START) * gs);
-    if (y == clipLineY) {
-        color.x = 0.20f; color.y = 0.12f; color.z = 0.12f;
         return color;
     }
 
@@ -314,42 +307,6 @@ __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p
     float outR = luma + (r - luma) * factor;
     float outG = luma + (g - luma) * factor;
     float outB = luma + (b - luma) * factor;
-
-    // ── 5. Soft clamp per channel ──
-    // Instead of clamping abstract saturation, we protect
-    // individual channels from exceeding gamut.
-    // We soft-clamp the color difference, then reconstruct.
-    float diffR = outR - luma;
-    float diffG = outG - luma;
-    float diffB = outB - luma;
-    float maxAbsDiff = _fmaxf(_fabs(diffR), _fmaxf(_fabs(diffG), _fabs(diffB)));
-
-    if (maxAbsDiff > 1e-6f) {
-        // Find the factor needed to keep within [0, 1]
-        // We want: luma + diff * scale ∈ [0, 1] for all channels
-        float scaleUp = 1.0f;
-        if (maxAbsDiff > 0.0f) {
-            // How far can we go before any channel clips?
-            float headroom = 1.0f;
-            if (diffR > 0.0f) headroom = _fminf(headroom, (1.0f - luma) / diffR);
-            else if (diffR < 0.0f) headroom = _fminf(headroom, -luma / diffR);
-            if (diffG > 0.0f) headroom = _fminf(headroom, (1.0f - luma) / diffG);
-            else if (diffG < 0.0f) headroom = _fminf(headroom, -luma / diffG);
-            if (diffB > 0.0f) headroom = _fminf(headroom, (1.0f - luma) / diffB);
-            else if (diffB < 0.0f) headroom = _fminf(headroom, -luma / diffB);
-
-            // If factor exceeds headroom, apply soft roll-off
-            if (factor > headroom * SOFT_CLIP_START && headroom > 1e-6f) {
-                float normalizedFactor = factor / headroom;
-                float clampedNorm = softClamp(normalizedFactor);
-                float softFactor = clampedNorm * headroom;
-                // Recompute with soft factor
-                outR = luma + (r - luma) * softFactor;
-                outG = luma + (g - luma) * softFactor;
-                outB = luma + (b - luma) * softFactor;
-            }
-        }
-    }
 
     // Final safety clamp
     outR = _fminf(_fmaxf(outR, 0.0f), 1.0f);
