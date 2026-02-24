@@ -1,10 +1,6 @@
 DEFINE_UI_PARAMS(p_Exp, 🎥 Exposure, DCTLUI_SLIDER_FLOAT, 0, -5, 5, 0.001)
 
-DEFINE_UI_PARAMS(p_Lift, Lift, DCTLUI_SLIDER_FLOAT, 0.0f, -1.0f, 1.0f, 0.001f)
-DEFINE_UI_PARAMS(p_Gamma, Gamma, DCTLUI_SLIDER_FLOAT, 0.0f, -1.0f, 1.0f, 0.001f)
-DEFINE_UI_PARAMS(p_Gain, Gain, DCTLUI_SLIDER_FLOAT, 1.0f, 0.0f, 2.0f, 0.001f)
-DEFINE_UI_PARAMS(p_Offset, Offset, DCTLUI_SLIDER_FLOAT, 0.0f, -1.0f, 1.0f, 0.001f)
-DEFINE_UI_PARAMS(p_SubSat, Sub. Saturation, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.001)
+DEFINE_UI_PARAMS(p_SubSat, Sub. Saturation, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.001)
 
 DEFINE_UI_PARAMS(p_Ramp, 💩 Ramp, DCTLUI_CHECK_BOX, 0)
 
@@ -37,63 +33,6 @@ __DEVICE__ float3 toDWG (float3 in) {
     out.x = in.x > lin_cut ? (_log2f(in.x + a) + b) * c : out.x = in.x * m;
     out.y = in.y > lin_cut ? (_log2f(in.y + a) + b) * c : out.y = in.y * m;
     out.z = in.z > lin_cut ? (_log2f(in.z + a) + b) * c : out.z = in.z * m;
-
-    return out;
-}
- 
-//Lift, Gamma, Gain Functions
-__DEVICE__ float applyLift(float in, float lift) {
-     return in * (1.0f - lift) + lift;
-}
-
-__DEVICE__ float3 applyLiftF3(float3 in, float lift) {
-    float3 out = in;
-
-    out.x = applyLift(out.x, lift);
-    out.y = applyLift(out.y, lift);
-    out.z = applyLift(out.z, lift);
-
-    return out;
-}
-
-__DEVICE__ float applyGamma(float in, float gamma) {
-    return _powf(in, (1.0f / (gamma + 1.0f)));
-}
-
-__DEVICE__ float3 applyGammaF3(float3 in, float gamma) {
-    float3 out = in;
-
-    out.x = applyGamma(out.x, gamma);
-    out.y = applyGamma(out.y, gamma);
-    out.z = applyGamma(out.z, gamma);
-
-    return out;
-}
-
-__DEVICE__ float applyGain(float in, float gain) {
-    return in * gain;
-}
-
-__DEVICE__ float3 applyGainF3(float3 in, float gain) {
-    float3 out = in;
-
-    out.x = applyGain(out.x, gain);
-    out.y = applyGain(out.y, gain);
-    out.z = applyGain(out.z, gain);
-
-    return out;
-}
-
-__DEVICE__ float applyOffset(float in, float offset) {
-    return in + offset;
-}
-
-__DEVICE__ float3 applyOffsetF3(float3 in, float offset) {
-    float3 out = in;
-
-    out.x = applyOffset(out.x, offset);
-    out.y = applyOffset(out.y, offset);
-    out.z = applyOffset(out.z, offset);
 
     return out;
 }
@@ -157,12 +96,6 @@ __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p
 
     // Convert Linear to DaVinci Intermediate
     out = toDWG (out);
-
-    // Apply Changes (LGG)
-    out = applyGammaF3(out, p_Gamma);
-    out = applyLiftF3(out, p_Lift);
-    out = applyGainF3(out, p_Gain);
-    out = applyOffsetF3(out, p_Offset);
 
     // Subtractive Saturation (Tetra Model)
     out = applyTetraSubSat(out.x, out.y, out.z, p_SubSat);
