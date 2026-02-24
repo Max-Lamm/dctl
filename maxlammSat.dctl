@@ -185,93 +185,59 @@ __DEVICE__ float computeOutputSatForCurve(
         sat_limiter, sat_mix
     );
     float outSat = inputSat * factor;
+    // return softClamp(_fmaxf(outSat, 0.0f));  // SOFT CLAMP DISABLED
     return _fmaxf(outSat, 0.0f);
 }
 
 
 // ─────────────────────────────────────────────────────────────
-// Curve overlay
+// Curve overlay – full-screen line, no background
+// X-axis: left = 0 input sat, right = 1 input sat
+// Y-axis: bottom = 0 output sat, top = 1 output sat
 // ─────────────────────────────────────────────────────────────
 __DEVICE__ float3 drawCurveOverlay(
     float3 color, int x, int y, int width, int height,
     float gain, float low, float mid, float high,
     float sat_limiter, float sat_mix
 ) {
-    int graphSize = (int)(_fminf((float)width, (float)height) * 0.25f);
-    int margin = 20;
-    int gx0 = margin;
-    int gy0 = height - margin - graphSize;
-    int gx1 = gx0 + graphSize;
-    int gy1 = gy0 + graphSize;
+    float fw = (float)width;
+    float fh = (float)height;
 
-    if (x < gx0 - 2 || x > gx1 + 2 || y < gy0 - 2 || y > gy1 + 2) {
-        return color;
-    }
-
-    // Background
-    if (x >= gx0 && x <= gx1 && y >= gy0 && y <= gy1) {
-        float a = 0.78f;
-        color.x = color.x * (1.0f - a) + 0.07f * a;
-        color.y = color.y * (1.0f - a) + 0.07f * a;
-        color.z = color.z * (1.0f - a) + 0.07f * a;
-    }
-
-    // Border
-    if ((x >= gx0 - 1 && x <= gx1 + 1 && (y == gy0 - 1 || y == gy1 + 1)) ||
-        (y >= gy0 - 1 && y <= gy1 + 1 && (x == gx0 - 1 || x == gx1 + 1))) {
-        color.x = 0.30f; color.y = 0.30f; color.z = 0.30f;
-        return color;
-    }
-
-    if (x < gx0 || x > gx1 || y < gy0 || y > gy1) return color;
-
-    float nx = (float)(x - gx0) / (float)graphSize;
-    float gs = (float)graphSize;
-
-    // Identity diagonal
-    int diagY = gy0 + (int)((1.0f - nx) * gs);
-    if (_fabs((float)(y - diagY)) < 1.0f) {
-        color.x = 0.22f; color.y = 0.22f; color.z = 0.22f;
-        return color;
-    }
-
-    // Grid at 0.25 intervals
-    for (int i = 1; i <= 3; i++) {
-        float gpos = (float)i * 0.25f;
-        int gridX = gx0 + (int)(gpos * gs);
-        int gridY = gy0 + (int)((1.0f - gpos) * gs);
-        if (x == gridX || y == gridY) {
-            color.x = 0.13f; color.y = 0.13f; color.z = 0.13f;
-            return color;
-        }
-    }
+    // Normalized position: nx = input sat (0..1), ny = screen Y (0=top, 1=bottom)
+    float nx = (float)x / fw;
+    float ny = (float)y / fh;
 
     float inputSat = nx;
 
-    // Main curve (midtone luma = 0.5) – orange
+    // ── Main curve (midtone luma = 0.5) – white line ──
     float outMain = computeOutputSatForCurve(inputSat, 0.5f, gain, low, mid, high, sat_limiter, sat_mix);
-    int pyMain = gy0 + (int)((1.0f - _fminf(outMain, 1.0f)) * gs);
-    if (_fabs((float)(y - pyMain)) <= 1.5f) {
-        color.x = 0.95f; color.y = 0.55f; color.z = 0.15f;
+    // Map output sat to screen Y: 0 = bottom, 1 = top → screenY = 1 - outSat
+    float curveY_main = 1.0f - _fminf(_fmaxf(outMain, 0.0f), 2.0f) * 0.5f;
+    // Scale to allow values up to 2.0 to be visible (top of screen = 2.0)
+    // Actually: map [0..1] output sat to full screen height
+    curveY_main = 1.0f - _fminf(_fmaxf(outMain, 0.0f), 1.0f);
+
+    if (_fabs(ny - curveY_main) < 1.5f / fh) {
+        color.x = 0.85f; color.y = 0.85f; color.z = 0.85f;
         return color;
     }
 
-    // Low zone (blue) at luma ≈ 0.05
+    // ── Low zone curve (blue) – only when Low is active ──
     if (_fabs(low) > 0.01f) {
         float outL = computeOutputSatForCurve(inputSat, 0.05f, gain, low, mid, high, sat_limiter, sat_mix);
-        int pyL = gy0 + (int)((1.0f - _fminf(outL, 1.0f)) * gs);
-        if (_fabs((float)(y - pyL)) <= 0.8f) {
-            color.x = 0.25f; color.y = 0.45f; color.z = 0.90f;
+        float curveY_low = 1.0f - _fminf(_fmaxf(outL, 0.0f), 1.0f);
+        if (_fabs(ny - curveY_low) < 1.0f / fh) {
+            color.x = 0.3f; color.y = 0.5f; color.z = 0.9f;
             return color;
         }
     }
 
-    // High zone (red) at luma ≈ 0.95
+    // ── High zone curve (red) – only when High is active ──
     if (_fabs(high) > 0.01f) {
         float outH = computeOutputSatForCurve(inputSat, 0.95f, gain, low, mid, high, sat_limiter, sat_mix);
-        int pyH = gy0 + (int)((1.0f - _fminf(outH, 1.0f)) * gs);
-        if (_fabs((float)(y - pyH)) <= 0.8f) {
-            color.x = 0.90f; color.y = 0.25f; color.z = 0.20f;
+        float curveY_high = 1.0f - _fminf(_fmaxf(outH, 0.0f), 1.0f);
+        if (_fabs(ny - curveY_high) < 1.0f / fh) {
+            color.x = 0.9f; color.y = 0.3f; color.z = 0.25f;
             return color;
         }
     }
@@ -307,6 +273,37 @@ __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p
     float outR = luma + (r - luma) * factor;
     float outG = luma + (g - luma) * factor;
     float outB = luma + (b - luma) * factor;
+
+    // ── 5. Soft clamp per channel – DISABLED ──
+    // Instead of clamping abstract saturation, we protect
+    // individual channels from exceeding gamut.
+    // We soft-clamp the color difference, then reconstruct.
+    // float diffR = outR - luma;
+    // float diffG = outG - luma;
+    // float diffB = outB - luma;
+    // float maxAbsDiff = _fmaxf(_fabs(diffR), _fmaxf(_fabs(diffG), _fabs(diffB)));
+    //
+    // if (maxAbsDiff > 1e-6f) {
+    //     float scaleUp = 1.0f;
+    //     if (maxAbsDiff > 0.0f) {
+    //         float headroom = 1.0f;
+    //         if (diffR > 0.0f) headroom = _fminf(headroom, (1.0f - luma) / diffR);
+    //         else if (diffR < 0.0f) headroom = _fminf(headroom, -luma / diffR);
+    //         if (diffG > 0.0f) headroom = _fminf(headroom, (1.0f - luma) / diffG);
+    //         else if (diffG < 0.0f) headroom = _fminf(headroom, -luma / diffG);
+    //         if (diffB > 0.0f) headroom = _fminf(headroom, (1.0f - luma) / diffB);
+    //         else if (diffB < 0.0f) headroom = _fminf(headroom, -luma / diffB);
+    //
+    //         if (factor > headroom * SOFT_CLIP_START && headroom > 1e-6f) {
+    //             float normalizedFactor = factor / headroom;
+    //             float clampedNorm = softClamp(normalizedFactor);
+    //             float softFactor = clampedNorm * headroom;
+    //             outR = luma + (r - luma) * softFactor;
+    //             outG = luma + (g - luma) * softFactor;
+    //             outB = luma + (b - luma) * softFactor;
+    //         }
+    //     }
+    // }
 
     // Final safety clamp
     outR = _fminf(_fmaxf(outR, 0.0f), 1.0f);
