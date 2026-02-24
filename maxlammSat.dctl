@@ -1,11 +1,11 @@
 // ═══════════════════════════════════════════════════════════════
-// MonacoSat – Advanced Saturation Control
-// Monacoframe © 2026
-// HSV-based saturation with luminance zone control,
-// saturation limiter, additive/subtractive mix, curve overlay
+// maxlammSat – Advanced Saturation Control v2
+// Maximilian Lamm © 2026
+// HSV+RGB hybrid saturation with luminance zone control,
+// soft clamp, saturation limiter, additive/subtractive mix
 // ═══════════════════════════════════════════════════════════════
 
-DEFINE_UI_PARAMS(p_gain, Gain, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(p_gain, Gain, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.01)
 DEFINE_UI_PARAMS(p_low, Low, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
 DEFINE_UI_PARAMS(p_mid, Mid, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
 DEFINE_UI_PARAMS(p_high, High, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
@@ -18,10 +18,27 @@ DEFINE_UI_PARAMS(p_show_masks, Show Masks, DCTLUI_CHECK_BOX, 0)
 
 
 // ─────────────────────────────────────────────────────────────
-// Rec.709 luminance (used for zone weighting only)
+// Constants
+// ─────────────────────────────────────────────────────────────
+__CONSTANT__ float SOFT_CLIP_START = 0.75f;
+__CONSTANT__ float SOFT_CLIP_END   = 1.0f;
+
+// Rec.709 luminance weights
+__CONSTANT__ float LW_R = 0.2126f;
+__CONSTANT__ float LW_G = 0.7152f;
+__CONSTANT__ float LW_B = 0.0722f;
+
+// How much counter-RGB desaturation to apply per unit of HSV boost.
+// 0.3 means: for every +1.0 HSV sat increase, blend 30% toward
+// the RGB-luma neutral to tame neon artifacts.
+__CONSTANT__ float RGB_COUNTER_STRENGTH = 0.3f;
+
+
+// ─────────────────────────────────────────────────────────────
+// Rec.709 luminance
 // ─────────────────────────────────────────────────────────────
 __DEVICE__ float luma709(float r, float g, float b) {
-    return r * 0.2126f + g * 0.7152f + b * 0.0722f;
+    return r * LW_R + g * LW_G + b * LW_B;
 }
 
 
@@ -39,7 +56,6 @@ __DEVICE__ float3 rgb_to_hsv(float r, float g, float b) {
 
     if (delta > 1e-6f) {
         s = delta / _fmaxf(cmax, 1e-6f);
-
         if (cmax == r) {
             h = (g - b) / delta;
             if (h < 0.0f) h += 6.0f;
@@ -52,9 +68,7 @@ __DEVICE__ float3 rgb_to_hsv(float r, float g, float b) {
     }
 
     float3 hsv;
-    hsv.x = h;
-    hsv.y = s;
-    hsv.z = v;
+    hsv.x = h; hsv.y = s; hsv.z = v;
     return hsv;
 }
 
@@ -69,7 +83,6 @@ __DEVICE__ float3 hsv_to_rgb(float h, float s, float v) {
     float m = v - c;
 
     float r, g, b;
-
     if (hp < 1.0f)      { r = c; g = x; b = 0.0f; }
     else if (hp < 2.0f) { r = x; g = c; b = 0.0f; }
     else if (hp < 3.0f) { r = 0.0f; g = c; b = x; }
@@ -78,9 +91,7 @@ __DEVICE__ float3 hsv_to_rgb(float h, float s, float v) {
     else                { r = c; g = 0.0f; b = x; }
 
     float3 rgb;
-    rgb.x = r + m;
-    rgb.y = g + m;
-    rgb.z = b + m;
+    rgb.x = r + m; rgb.y = g + m; rgb.z = b + m;
     return rgb;
 }
 
@@ -95,10 +106,27 @@ __DEVICE__ float smoothstep_f(float edge0, float edge1, float x) {
 
 
 // ─────────────────────────────────────────────────────────────
+// Soft Clamp: values above SOFT_CLIP_START smoothly roll off
+// toward SOFT_CLIP_END. Below the threshold, passthrough.
+// Uses a quadratic shoulder curve.
+// ─────────────────────────────────────────────────────────────
+__DEVICE__ float softClamp(float x) {
+    if (x <= SOFT_CLIP_START) {
+        return x;
+    }
+    // Quadratic ease into ceiling
+    // Maps [0.75, ∞) → [0.75, 1.0) asymptotically
+    float overshoot = x - SOFT_CLIP_START;
+    float range = SOFT_CLIP_END - SOFT_CLIP_START; // 0.25
+    // Attempt: shoulder = range * overshoot / (overshoot + range)
+    // At overshoot=0 → 0, at overshoot=range → range/2, at overshoot→∞ → range
+    float shoulder = range * overshoot / (overshoot + range);
+    return SOFT_CLIP_START + shoulder;
+}
+
+
+// ─────────────────────────────────────────────────────────────
 // Luminance zone weights
-//   Low:  peaks at luma 0.0, fades by ~0.45
-//   Mid:  peaks at luma 0.5, bell from ~0.15 to ~0.85
-//   High: peaks at luma 1.0, fades in from ~0.55
 // ─────────────────────────────────────────────────────────────
 __DEVICE__ float zoneWeight_low(float luma) {
     return 1.0f - smoothstep_f(0.15f, 0.45f, luma);
@@ -115,56 +143,77 @@ __DEVICE__ float zoneWeight_high(float luma) {
 
 // ─────────────────────────────────────────────────────────────
 // Sat Limiter
-//   Negative (-1..0): attenuate effect on highly saturated pixels
-//     → protects already-vivid colors from over-saturation
-//   Positive (0..+1): attenuate effect on low-saturation pixels
-//     → protects near-neutral tones from being pushed
 // ─────────────────────────────────────────────────────────────
 __DEVICE__ float satLimiterFactor(float sat, float limiter) {
     if (_fabs(limiter) < 1e-6f) return 1.0f;
 
     if (limiter < 0.0f) {
-        // Negative: reduce effect where saturation is high
-        float strength = -limiter;
-        return 1.0f - strength * sat;
+        return 1.0f - (-limiter) * sat;
     } else {
-        // Positive: reduce effect where saturation is low
-        float strength = limiter;
-        return 1.0f - strength * (1.0f - sat);
+        return 1.0f - limiter * (1.0f - sat);
     }
 }
 
 
 // ─────────────────────────────────────────────────────────────
-// Sat Mix: additive vs subtractive saturation
-//   mix = -1: fully subtractive → newSat = sat * (1 + adj)
-//     Proportional, preserves relative color balance
-//   mix =  0: balanced 50/50 blend
-//   mix = +1: fully additive → newSat = sat + adj
-//     Uniform shift, can push neutrals into color
+// Sat Mix: additive vs subtractive
+// Works with additive adjustment from zone sliders.
+// Gain is handled separately as a multiplier.
 // ─────────────────────────────────────────────────────────────
 __DEVICE__ float applySatMix(float sat, float adjustment, float mix) {
     float blend = (mix + 1.0f) * 0.5f;
-
     float subtractive = sat * (1.0f + adjustment);
     float additive = sat + adjustment;
-
     float result = subtractive * (1.0f - blend) + additive * blend;
     return _fmaxf(result, 0.0f);
 }
 
 
 // ─────────────────────────────────────────────────────────────
-// Curve overlay – renders a sat transfer graph
-// X = input saturation, Y = output saturation
-// Shows: main curve (orange), low zone (blue), high zone (red)
+// Compute the full saturation adjustment for a given input sat
+// and luminance. Used by both the main transform and the
+// curve overlay to ensure they always match.
+//
+// gain is multiplicative (1.0 = neutral), zone sliders are
+// additive offsets.
+// ─────────────────────────────────────────────────────────────
+__DEVICE__ float computeOutputSat(
+    float inputSat, float luma,
+    float gain, float low, float mid, float high,
+    float sat_limiter, float sat_mix
+) {
+    // Step 1: Multiplicative gain (1.0 = no change)
+    float sat = inputSat * gain;
+
+    // Step 2: Additive zone adjustment
+    float wL = zoneWeight_low(luma);
+    float wM = zoneWeight_mid(luma);
+    float wH = zoneWeight_high(luma);
+    float zoneAdj = low * wL + mid * wM + high * wH;
+
+    // Step 3: Limiter modulates zone adjustment
+    zoneAdj *= satLimiterFactor(sat, sat_limiter);
+
+    // Step 4: Apply zone adj via sat mix
+    if (_fabs(zoneAdj) > 1e-6f) {
+        sat = applySatMix(sat, zoneAdj, sat_mix);
+    }
+
+    // Step 5: Soft clamp – no oversaturation
+    sat = softClamp(_fmaxf(sat, 0.0f));
+
+    return sat;
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// Curve overlay
 // ─────────────────────────────────────────────────────────────
 __DEVICE__ float3 drawCurveOverlay(
     float3 color, int x, int y, int width, int height,
     float gain, float low, float mid, float high,
     float sat_limiter, float sat_mix
 ) {
-    // Graph sizing: 25% of shortest dimension, bottom-left
     int graphSize = (int)(_fminf((float)width, (float)height) * 0.25f);
     int margin = 20;
     int gx0 = margin;
@@ -172,17 +221,16 @@ __DEVICE__ float3 drawCurveOverlay(
     int gx1 = gx0 + graphSize;
     int gy1 = gy0 + graphSize;
 
-    // Early exit if outside graph area
     if (x < gx0 - 2 || x > gx1 + 2 || y < gy0 - 2 || y > gy1 + 2) {
         return color;
     }
 
-    // Semi-transparent background
+    // Background
     if (x >= gx0 && x <= gx1 && y >= gy0 && y <= gy1) {
-        float bgA = 0.78f;
-        color.x = color.x * (1.0f - bgA) + 0.07f * bgA;
-        color.y = color.y * (1.0f - bgA) + 0.07f * bgA;
-        color.z = color.z * (1.0f - bgA) + 0.07f * bgA;
+        float a = 0.78f;
+        color.x = color.x * (1.0f - a) + 0.07f * a;
+        color.y = color.y * (1.0f - a) + 0.07f * a;
+        color.z = color.z * (1.0f - a) + 0.07f * a;
     }
 
     // Border
@@ -192,17 +240,22 @@ __DEVICE__ float3 drawCurveOverlay(
         return color;
     }
 
-    if (x < gx0 || x > gx1 || y < gy0 || y > gy1) {
-        return color;
-    }
+    if (x < gx0 || x > gx1 || y < gy0 || y > gy1) return color;
 
     float nx = (float)(x - gx0) / (float)graphSize;
     float gs = (float)graphSize;
 
-    // Diagonal identity line
+    // Identity diagonal
     int diagY = gy0 + (int)((1.0f - nx) * gs);
     if (_fabs((float)(y - diagY)) < 1.0f) {
         color.x = 0.22f; color.y = 0.22f; color.z = 0.22f;
+        return color;
+    }
+
+    // Soft clamp threshold line (horizontal at 0.75)
+    int clipLineY = gy0 + (int)((1.0f - SOFT_CLIP_START) * gs);
+    if (y == clipLineY) {
+        color.x = 0.18f; color.y = 0.12f; color.z = 0.12f;
         return color;
     }
 
@@ -219,38 +272,28 @@ __DEVICE__ float3 drawCurveOverlay(
 
     float inputSat = nx;
 
-    // ── Main curve (mid-tone luma = 0.5) ──
-    float luma = 0.5f;
-    float wL = zoneWeight_low(luma);
-    float wM = zoneWeight_mid(luma);
-    float wH = zoneWeight_high(luma);
-    float adj = gain + low * wL + mid * wM + high * wH;
-    adj *= satLimiterFactor(inputSat, sat_limiter);
-    float outMain = _fminf(applySatMix(inputSat, adj, sat_mix), 1.0f);
-    int pyMain = gy0 + (int)((1.0f - outMain) * gs);
+    // Main curve (mid-tone luma = 0.5)
+    float outMain = computeOutputSat(inputSat, 0.5f, gain, low, mid, high, sat_limiter, sat_mix);
+    int pyMain = gy0 + (int)((1.0f - _fminf(outMain, 1.0f)) * gs);
     if (_fabs((float)(y - pyMain)) <= 1.5f) {
         color.x = 0.95f; color.y = 0.55f; color.z = 0.15f;
         return color;
     }
 
-    // ── Low zone curve (blue) – only if Low slider is active ──
+    // Low zone (blue) at luma ≈ 0.05
     if (_fabs(low) > 0.01f) {
-        float adjL = gain + low;  // full low weight at luma ≈ 0
-        adjL *= satLimiterFactor(inputSat, sat_limiter);
-        float outL = _fminf(applySatMix(inputSat, adjL, sat_mix), 1.0f);
-        int pyL = gy0 + (int)((1.0f - outL) * gs);
+        float outL = computeOutputSat(inputSat, 0.05f, gain, low, mid, high, sat_limiter, sat_mix);
+        int pyL = gy0 + (int)((1.0f - _fminf(outL, 1.0f)) * gs);
         if (_fabs((float)(y - pyL)) <= 0.8f) {
             color.x = 0.25f; color.y = 0.45f; color.z = 0.90f;
             return color;
         }
     }
 
-    // ── High zone curve (red) – only if High slider is active ──
+    // High zone (red) at luma ≈ 0.95
     if (_fabs(high) > 0.01f) {
-        float adjH = gain + high;  // full high weight at luma ≈ 1
-        adjH *= satLimiterFactor(inputSat, sat_limiter);
-        float outH = _fminf(applySatMix(inputSat, adjH, sat_mix), 1.0f);
-        int pyH = gy0 + (int)((1.0f - outH) * gs);
+        float outH = computeOutputSat(inputSat, 0.95f, gain, low, mid, high, sat_limiter, sat_mix);
+        int pyH = gy0 + (int)((1.0f - _fminf(outH, 1.0f)) * gs);
         if (_fabs((float)(y - pyH)) <= 0.8f) {
             color.x = 0.90f; color.y = 0.25f; color.z = 0.20f;
             return color;
@@ -272,33 +315,47 @@ __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p
 
     // ── 1. RGB → HSV ──
     float3 hsv = rgb_to_hsv(r, g, b);
-    float hue = hsv.x;
-    float sat = hsv.y;
-    float val = hsv.z;
+    float hue      = hsv.x;
+    float origSat  = hsv.y;
+    float val      = hsv.z;
 
-    // ── 2. Luminance for zone targeting (Rec.709) ──
+    // ── 2. Luminance for zone targeting ──
     float luma = luma709(r, g, b);
 
-    // ── 3. Zone weights ──
-    float wLow  = zoneWeight_low(luma);
-    float wMid  = zoneWeight_mid(luma);
-    float wHigh = zoneWeight_high(luma);
+    // ── 3. Compute new saturation ──
+    float newSat = computeOutputSat(
+        origSat, luma,
+        p_gain, p_low, p_mid, p_high,
+        p_sat_limiter, p_sat_mix
+    );
 
-    // ── 4. Total adjustment = global gain + zone contributions ──
-    float adjustment = p_gain + p_low * wLow + p_mid * wMid + p_high * wHigh;
+    // ── 4. HSV → RGB (primary result) ──
+    float3 hsvResult = hsv_to_rgb(hue, newSat, val);
 
-    // ── 5. Sat Limiter modulation ──
-    float limFactor = satLimiterFactor(sat, p_sat_limiter);
-    adjustment *= limFactor;
+    // ── 5. RGB counter-desaturation for natural look ──
+    // When saturation is boosted (newSat > origSat), blend
+    // a small amount toward RGB-luma neutral to tame the
+    // neon/plastic look that pure HSV saturation causes.
+    // When desaturating, this has no effect.
+    float satDelta = newSat - origSat;
 
-    // ── 6. Apply via Sat Mix (additive ↔ subtractive) ──
-    float newSat = applySatMix(sat, adjustment, p_sat_mix);
-    newSat = _fminf(_fmaxf(newSat, 0.0f), 1.0f);
+    if (satDelta > 0.0f) {
+        // How much counter-desat to apply: proportional to boost amount
+        float counterAmount = satDelta * RGB_COUNTER_STRENGTH;
+        counterAmount = _fminf(counterAmount, 0.5f);  // safety cap
 
-    // ── 7. HSV → RGB ──
-    float3 rgb = hsv_to_rgb(hue, newSat, val);
+        // Luma-neutral target (desaturated version in RGB)
+        float lumaOut = luma709(hsvResult.x, hsvResult.y, hsvResult.z);
 
-    // ── 8. Curve overlay ──
+        // Blend HSV result toward neutral by counterAmount
+        hsvResult.x = hsvResult.x + (lumaOut - hsvResult.x) * counterAmount;
+        hsvResult.y = hsvResult.y + (lumaOut - hsvResult.y) * counterAmount;
+        hsvResult.z = hsvResult.z + (lumaOut - hsvResult.z) * counterAmount;
+    }
+
+    float3 rgb = hsvResult;
+
+    // ── 6. Curve overlay ──
     if (p_show_curve) {
         rgb = drawCurveOverlay(
             rgb, p_X, p_Y, p_Width, p_Height,
