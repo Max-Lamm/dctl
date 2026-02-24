@@ -1,19 +1,133 @@
+DEFINE_UI_PARAMS(p_Exp, 🎥 Exposure, DCTLUI_SLIDER_FLOAT, 0, -5, 5, 0.001)
+
+DEFINE_UI_PARAMS(p_Lift, Lift, DCTLUI_SLIDER_FLOAT, 0.0f, -1.0f, 1.0f, 0.001f)
+DEFINE_UI_PARAMS(p_Gamma, Gamma, DCTLUI_SLIDER_FLOAT, 0.0f, -1.0f, 1.0f, 0.001f)
+DEFINE_UI_PARAMS(p_Gain, Gain, DCTLUI_SLIDER_FLOAT, 1.0f, 0.0f, 2.0f, 0.001f)
+DEFINE_UI_PARAMS(p_Offset, Offset, DCTLUI_SLIDER_FLOAT, 0.0f, -1.0f, 1.0f, 0.001f)
+
+DEFINE_UI_PARAMS(p_Ramp, 💩 Ramp, DCTLUI_CHECK_BOX, 0)
+
+// Transfer Functions
+__DEVICE__ float3 fromDWG (float3 in) {
+    float3 out;
+
+    float a = 0.0075f;
+    float b = 7.0f;
+    float c = 0.07329248f;
+    float m = 10.44426855f;
+    float log_cut = 0.02740668f;
+
+    out.x = in.x > log_cut ? _powf(2.0f, (in.x / c) - b) - a : in.x / m;
+    out.y = in.y > log_cut ? _powf(2.0f, (in.y / c) - b) - a : in.y / m;
+    out.z = in.z > log_cut ? _powf(2.0f, (in.z / c) - b) - a : in.z / m;
+    
+    return out;
+}
+
+__DEVICE__ float3 toDWG (float3 in) {
+    float3 out;
+
+    float a = 0.0075;
+    float b = 7.0;
+    float c = 0.07329248;
+    float m = 10.44426855;
+    float lin_cut = 0.00262409;
+
+    out.x = in.x > lin_cut ? (_log2f(in.x + a) + b) * c : out.x = in.x * m;
+    out.y = in.y > lin_cut ? (_log2f(in.y + a) + b) * c : out.y = in.y * m;
+    out.z = in.z > lin_cut ? (_log2f(in.z + a) + b) * c : out.z = in.z * m;
+
+    return out;
+}
+ 
+//Lift, Gamma, Gain Functions
+__DEVICE__ float applyLift(float in, float lift) {
+     return in * (1.0f - lift) + lift;
+}
+
+__DEVICE__ float3 applyLiftF3(float3 in, float lift) {
+    float3 out = in;
+
+    out.x = applyLift(out.x, lift);
+    out.y = applyLift(out.y, lift);
+    out.z = applyLift(out.z, lift);
+
+    return out;
+}
+
+__DEVICE__ float applyGamma(float in, float gamma) {
+    return _powf(in, (1.0f / (gamma + 1.0f)));
+}
+
+__DEVICE__ float3 applyGammaF3(float3 in, float gamma) {
+    float3 out = in;
+
+    out.x = applyGamma(out.x, gamma);
+    out.y = applyGamma(out.y, gamma);
+    out.z = applyGamma(out.z, gamma);
+
+    return out;
+}
+
+__DEVICE__ float applyGain(float in, float gain) {
+    return in * gain;
+}
+
+__DEVICE__ float3 applyGainF3(float3 in, float gain) {
+    float3 out = in;
+
+    out.x = applyGain(out.x, gain);
+    out.y = applyGain(out.y, gain);
+    out.z = applyGain(out.z, gain);
+
+    return out;
+}
+
+__DEVICE__ float applyOffset(float in, float offset) {
+    return in + offset;
+}
+
+__DEVICE__ float3 applyOffsetF3(float3 in, float offset) {
+    float3 out = in;
+
+    out.x = applyOffset(out.x, offset);
+    out.y = applyOffset(out.y, offset);
+    out.z = applyOffset(out.z, offset);
+
+    return out;
+}
+
 __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B) {    
     float3 in_RGB = make_float3(p_R, p_G, p_B);
     float3 out = in_RGB;
 
-    float lift = 0.0f;
-    float gamma = 0.0f;
-    float gain = 1.0f;
-    float offset = 0.0f;
+    if (p_Ramp == 1) {
+        float width = (float) p_Width;
+        float height = (float) p_Height;
+        float X = (float) p_X;
+        float Y = (float) p_Y;
+        float rX = X/width;
+        float rY = Y/height;
 
+        if (rY > 0.95f) {
+            out = make_float3(rX, rX, rX);
+        }
+    }
 
-    out = out * (1.0f - lift) + lift;
-    out.x = _powf(out.x, (1.0f / (gamma + 1.0f)));
-    out.y = _powf(out.y, (1.0f / (gamma + 1.0f)));
-    out.z = _powf(out.z, (1.0f / (gamma + 1.0f)));
-    out = out * gain;
-    out = out + offset;
+    // Convert DaVinci Intermediate to Linear
+    out = fromDWG (out);
+
+    // Exposure
+    out *= _powf(2, p_Exp);
+
+    // Convert Linear to DaVinci Intermediate
+    out = toDWG (out);
+
+    // Apply Changes (LGG)
+    out = applyGammaF3(out, p_Gamma);
+    out = applyLiftF3(out, p_Lift);
+    out = applyGainF3(out, p_Gain);
+    out = applyOffsetF3(out, p_Offset);
 
     return out;
 }
