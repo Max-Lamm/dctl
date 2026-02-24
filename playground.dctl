@@ -1,0 +1,19 @@
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B) {    
+    float3 in_RGB = make_float3(p_R, p_G, p_B);
+    float3 out = in_RGB;
+
+    float lift = 0.0f;
+    float gamma = 0.0f;
+    float gain = 1.0f;
+    float offset = 0.0f;
+
+
+    out = out * (1.0f - lift) + lift;
+    out.x = _powf(out.x, (1.0f / (gamma + 1.0f)));
+    out.y = _powf(out.y, (1.0f / (gamma + 1.0f)));
+    out.z = _powf(out.z, (1.0f / (gamma + 1.0f)));
+    out = out * gain;
+    out = out + offset;
+
+    return out;
+}
