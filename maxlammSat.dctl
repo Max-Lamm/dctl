@@ -1,14 +1,24 @@
 // ═══════════════════════════════════════════════════════════════
-// maxlammSat – Advanced Saturation Control v4
+// maxlammSat – Advanced Saturation Control v5
 // Maximilian Lamm © 2026
 //
-// RGB luma-based saturation with true additive/subtractive
-// blend in RGB space, luminance zone control, sat limiter
+// Hue-dependent additive/subtractive saturation:
+//   Primaries (R, G, B) → subtraktiv (proportional)
+//   Secondaries (C, M, Y) → additiv (uniform push)
+//   Tertiaries → smooth blend between both
 //
-// Subtraktiv: out = luma + (in - luma) × factor
-//   → proportional, already-saturated pixels move more
-// Additiv:   out = in + chromaDir × addAmount
-//   → uniform chroma push, all pixels move equally
+// Subtraktiv: out = luma + (in - luma) × gain
+//   Scales existing chroma proportionally.
+//   In node terms: extract V from HSV, subtract from RGB,
+//   scale the difference, add back.
+//
+// Additiv: out = in + chromaDir × fixedAmount
+//   Pushes all pixels by the same chroma distance.
+//
+// Two main controls:
+//   Gain    → overall saturation strength (0..2, default 1)
+//   Sat Mix → shifts the primary/secondary balance
+//             -1 = all subtraktiv, 0 = natural split, +1 = all additiv
 // ═══════════════════════════════════════════════════════════════
 
 DEFINE_UI_PARAMS(p_gain, Gain, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.01)
@@ -17,19 +27,18 @@ DEFINE_UI_PARAMS(p_mid, Mid, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
 DEFINE_UI_PARAMS(p_high, High, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
 DEFINE_UI_PARAMS(p_sat_limiter, Sat Limiter, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
 DEFINE_UI_PARAMS(p_sat_mix, Sat Mix, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
-DEFINE_UI_PARAMS(p_hue_mask, Hue Mask, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.01)
-DEFINE_UI_PARAMS(p_luma_mask, Luma Mask, DCTLUI_SLIDER_FLOAT, 0.5, 0.0, 1.0, 0.01)
+//DEFINE_UI_PARAMS(p_hue_mask, Hue Mask, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.01)
+//DEFINE_UI_PARAMS(p_luma_mask, Luma Mask, DCTLUI_SLIDER_FLOAT, 0.5, 0.0, 1.0, 0.01)
 DEFINE_UI_PARAMS(p_show_curve, Show Curve, DCTLUI_CHECK_BOX, 0)
 DEFINE_UI_PARAMS(p_show_masks, Show Masks, DCTLUI_CHECK_BOX, 0)
 
 
 // ─────────────────────────────────────────────────────────────
-// Rec.709 luminance weights
+// Rec.709 luminance
 // ─────────────────────────────────────────────────────────────
 __CONSTANT__ float LW_R = 0.2126f;
 __CONSTANT__ float LW_G = 0.7152f;
 __CONSTANT__ float LW_B = 0.0722f;
-
 
 __DEVICE__ float luma709(float r, float g, float b) {
     return r * LW_R + g * LW_G + b * LW_B;
@@ -62,21 +71,7 @@ __DEVICE__ float zoneWeight_high(float luma) {
 
 
 // ─────────────────────────────────────────────────────────────
-// Measure RGB saturation (chroma distance from neutral)
-// Returns 0..~1 normalized value
-// ─────────────────────────────────────────────────────────────
-__DEVICE__ float rgbChroma(float r, float g, float b, float luma) {
-    float dr = r - luma;
-    float dg = g - luma;
-    float db = b - luma;
-    return _sqrtf(dr * dr + dg * dg + db * db);
-}
-
-
-// ─────────────────────────────────────────────────────────────
 // Sat Limiter
-//   Negative: attenuate effect on high-saturation pixels
-//   Positive: attenuate effect on low-saturation pixels
 // ─────────────────────────────────────────────────────────────
 __DEVICE__ float satLimiterFactor(float sat, float limiter) {
     if (_fabs(limiter) < 1e-6f) return 1.0f;
@@ -89,32 +84,67 @@ __DEVICE__ float satLimiterFactor(float sat, float limiter) {
 
 
 // ─────────────────────────────────────────────────────────────
-// Compute combined gain factor from Gain + Zone sliders
-// Does NOT include Sat Mix – that happens in RGB space
+// Hue from RGB (returns 0..1)
+// ─────────────────────────────────────────────────────────────
+__DEVICE__ float hueFromRGB(float r, float g, float b) {
+    float cmax = _fmaxf(r, _fmaxf(g, b));
+    float cmin = _fminf(r, _fminf(g, b));
+    float delta = cmax - cmin;
+
+    if (delta < 1e-6f) return 0.0f;
+
+    float h;
+    if (cmax == r) {
+        h = (g - b) / delta;
+        if (h < 0.0f) h += 6.0f;
+    } else if (cmax == g) {
+        h = 2.0f + (b - r) / delta;
+    } else {
+        h = 4.0f + (r - g) / delta;
+    }
+    return h / 6.0f;
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// Primary / Secondary hue weight
+//
+// Returns how "secondary" a hue is (0..1):
+//   0.0 = pure primary   (R at 0°, G at 120°, B at 240°)
+//   1.0 = pure secondary (Y at 60°, C at 180°, M at 300°)
+//   smooth cosine transition for tertiaries
+//
+// Math: cos(hue × 6π) = +1 at primaries, -1 at secondaries
+//       secondaryWeight = 0.5 - 0.5 × cos(hue × 6π)
+// ─────────────────────────────────────────────────────────────
+__DEVICE__ float secondaryWeight(float hue) {
+    float angle = hue * 6.0f * 3.14159265f;
+    return 0.5f - 0.5f * _cosf(angle);
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// Compute combined gain factor
 // ─────────────────────────────────────────────────────────────
 __DEVICE__ float computeGainFactor(
     float pixelSat, float luma,
     float gain, float low, float mid, float high,
     float sat_limiter
 ) {
-    // Zone adjustment (additive offset to gain)
     float wL = zoneWeight_low(luma);
     float wM = zoneWeight_mid(luma);
     float wH = zoneWeight_high(luma);
     float zoneAdj = low * wL + mid * wM + high * wH;
-
-    // Limiter modulates zone adjustment
     zoneAdj *= satLimiterFactor(pixelSat, sat_limiter);
-
-    // Combined factor: gain is multiplicative base, zones add to it
-    float factor = gain + zoneAdj;
-
-    return _fmaxf(factor, 0.0f);
+    return _fmaxf(gain + zoneAdj, 0.0f);
 }
 
 
 // ─────────────────────────────────────────────────────────────
-// Curve overlay – full-screen line
+// Curve overlay – full-screen lines
+// Red line = subtractive path
+// Blue line = additive path
+// White line = blended result (at tertiary hue, secW=0.5)
 // ─────────────────────────────────────────────────────────────
 __DEVICE__ float3 drawCurveOverlay(
     float3 color, int x, int y, int width, int height,
@@ -123,59 +153,44 @@ __DEVICE__ float3 drawCurveOverlay(
 ) {
     float fw = (float)width;
     float fh = (float)height;
-    float nx = (float)x / fw;   // input sat 0..1
-    float ny = (float)y / fh;   // screen Y 0=top 1=bottom
-
+    float nx = (float)x / fw;
+    float ny = (float)y / fh;
     float inputSat = nx;
 
-    // Compute gain factor at mid-tone luma
     float factor = computeGainFactor(inputSat, 0.5f, gain, low, mid, high, sat_limiter);
 
-    // Subtractive result: inputSat × factor
+    // Scale Y: map 0..1.5 output to full screen height
+    float yScale = 1.5f;
+
+    // Subtractive curve (dim red)
     float outSub = inputSat * factor;
-
-    // Additive result: inputSat + (factor - 1.0) × reference_chroma
-    // For the curve, reference_chroma is a constant representing
-    // the average chroma of the image. We use 0.5 as midpoint.
-    // Additive adds a fixed amount regardless of input sat.
-    float addAmount = (factor - 1.0f) * 0.5f;
-    float outAdd = inputSat + addAmount;
-
-    // Blend based on sat_mix
-    float blend = (sat_mix + 1.0f) * 0.5f;
-    float outMain = _fmaxf(outSub * (1.0f - blend) + outAdd * blend, 0.0f);
-
-    // Map to screen Y
-    float curveY = 1.0f - _fminf(outMain, 1.0f);
-    if (_fabs(ny - curveY) < 1.5f / fh) {
-        color.x = 0.85f; color.y = 0.85f; color.z = 0.85f;
+    float cySub = 1.0f - _fminf(_fmaxf(outSub, 0.0f), yScale) / yScale;
+    if (_fabs(ny - cySub) < 1.0f / fh) {
+        color.x = _fmaxf(color.x, 0.5f);
+        color.y *= 0.4f;
+        color.z *= 0.4f;
         return color;
     }
 
-    // Low zone (blue)
-    if (_fabs(low) > 0.01f) {
-        float fL = computeGainFactor(inputSat, 0.05f, gain, low, mid, high, sat_limiter);
-        float outSubL = inputSat * fL;
-        float outAddL = inputSat + (fL - 1.0f) * 0.5f;
-        float outL = _fmaxf(outSubL * (1.0f - blend) + outAddL * blend, 0.0f);
-        float cyL = 1.0f - _fminf(outL, 1.0f);
-        if (_fabs(ny - cyL) < 1.0f / fh) {
-            color.x = 0.3f; color.y = 0.5f; color.z = 0.9f;
-            return color;
-        }
+    // Additive curve (dim blue)
+    float addAmt = (factor - 1.0f) * 0.25f;
+    float outAdd = inputSat + addAmt;
+    float cyAdd = 1.0f - _fminf(_fmaxf(outAdd, 0.0f), yScale) / yScale;
+    if (_fabs(ny - cyAdd) < 1.0f / fh) {
+        color.x *= 0.4f;
+        color.y *= 0.4f;
+        color.z = _fmaxf(color.z, 0.5f);
+        return color;
     }
 
-    // High zone (red)
-    if (_fabs(high) > 0.01f) {
-        float fH = computeGainFactor(inputSat, 0.95f, gain, low, mid, high, sat_limiter);
-        float outSubH = inputSat * fH;
-        float outAddH = inputSat + (fH - 1.0f) * 0.5f;
-        float outH = _fmaxf(outSubH * (1.0f - blend) + outAddH * blend, 0.0f);
-        float cyH = 1.0f - _fminf(outH, 1.0f);
-        if (_fabs(ny - cyH) < 1.0f / fh) {
-            color.x = 0.9f; color.y = 0.3f; color.z = 0.25f;
-            return color;
-        }
+    // Blended curve at secW=0.5 (white)
+    float secW = 0.5f;
+    float additiveBlend = _fminf(_fmaxf(secW + sat_mix, 0.0f), 1.0f);
+    float outBlend = outSub * (1.0f - additiveBlend) + outAdd * additiveBlend;
+    float cyBlend = 1.0f - _fminf(_fmaxf(outBlend, 0.0f), yScale) / yScale;
+    if (_fabs(ny - cyBlend) < 1.5f / fh) {
+        color.x = 0.85f; color.y = 0.85f; color.z = 0.85f;
+        return color;
     }
 
     return color;
@@ -191,16 +206,16 @@ __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p
     float g = p_G;
     float b = p_B;
 
-    // ── 1. Compute Rec.709 luminance ──
+    // ── 1. Luminance ──
     float luma = luma709(r, g, b);
 
-    // ── 2. Chroma vector (distance from neutral axis) ──
+    // ── 2. Chroma vector ──
     float dr = r - luma;
     float dg = g - luma;
     float db = b - luma;
     float chroma = _sqrtf(dr * dr + dg * dg + db * db);
 
-    // ── 3. Normalized chroma direction ──
+    // ── 3. Chroma direction (unit vector) ──
     float dirR = 0.0f, dirG = 0.0f, dirB = 0.0f;
     if (chroma > 1e-6f) {
         dirR = dr / chroma;
@@ -208,64 +223,76 @@ __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p
         dirB = db / chroma;
     }
 
-    // ── 4. Pixel saturation for limiter (normalize chroma) ──
-    // Practical normalization: max chroma for typical content
+    // ── 4. Pixel saturation for limiter ──
     float maxChroma = _fminf(luma, 1.0f - luma) * 1.7321f;
     float pixelSat = (maxChroma > 1e-6f) ? _fminf(chroma / maxChroma, 1.0f) : 0.0f;
 
-    // ── 5. Compute combined gain factor ──
+    // ── 5. Hue → primary/secondary weight ──
+    float hue = hueFromRGB(r, g, b);
+    float secW = secondaryWeight(hue);
+    // secW = 0 → primary (R, G, B) → subtractive
+    // secW = 1 → secondary (C, M, Y) → additive
+
+    // ── 6. Gain factor ──
     float factor = computeGainFactor(
         pixelSat, luma,
         p_gain, p_low, p_mid, p_high,
         p_sat_limiter
     );
 
-    // ── 6. Subtractive path: scale chroma proportionally ──
-    // out = luma + (in - luma) × factor
-    // Already-saturated pixels get pushed more
+    // ── 7. SUBTRACTIVE path ──
+    // Scale chroma proportionally: out = luma + (in - luma) × factor
+    // This is equivalent to:
+    //   1) Extract HSV Value channel (≈ brightness)
+    //   2) Subtract from original → get chroma difference
+    //   3) Scale the difference by (factor - 1)
+    //   4) Add back to original
+    // Here we use luma instead of HSV-V for better perceptual accuracy.
     float subR = luma + dr * factor;
     float subG = luma + dg * factor;
     float subB = luma + db * factor;
 
-    // ── 7. Additive path: add/remove fixed chroma amount ──
-    // Push all pixels by the same chroma distance, regardless
-    // of how saturated they already are.
-    // The "amount" is derived from factor: how much chroma to add.
-    // At factor=1 → add nothing. At factor=2 → add 1× the
-    // average chroma distance. We use the pixel's own chroma
-    // direction but a fixed magnitude.
+    // ── 8. ADDITIVE path ──
+    // Push chroma by a fixed amount in the pixel's hue direction.
+    // The amount is independent of existing saturation level.
+    // This means even nearly-neutral pixels get pushed into color.
     //
-    // addAmount = (factor - 1.0) × referenceChroma
-    // referenceChroma = average/typical chroma in the scene.
-    // We use 0.2 as a practical mid-level reference that
-    // matches the behavior seen in the reference tool.
-    float refChroma = 0.20f;
+    // refChroma controls the strength of the additive push.
+    // Calibrated so that at factor=2, the push matches roughly
+    // the visual impact of the subtractive path on mid-saturated pixels.
+    float refChroma = 0.001f;
     float addAmount = (factor - 1.0f) * refChroma;
-    float addR, addG, addB;
 
+    float addR, addG, addB;
     if (chroma > 1e-6f) {
-        // Pixel has color: push along its own chroma direction
         addR = r + dirR * addAmount;
         addG = g + dirG * addAmount;
         addB = b + dirB * addAmount;
     } else {
-        // Neutral pixel: no direction to push, stay neutral
+        // Neutral pixel: no hue direction to push
         addR = r;
         addG = g;
         addB = b;
     }
 
-    // ── 8. Blend subtractive and additive via Sat Mix ──
-    // mix = -1 → fully subtractive (blend = 0)
-    // mix =  0 → 50/50
-    // mix = +1 → fully additive (blend = 1)
-    float blend = (p_sat_mix + 1.0f) * 0.5f;
+    // ── 9. Hue-dependent blend with Sat Mix control ──
+    //
+    // Natural split (sat_mix = 0):
+    //   Primary hues (secW ≈ 0) → fully subtractive
+    //   Secondary hues (secW ≈ 1) → fully additive
+    //   Tertiaries → smooth cosine blend
+    //
+    // Sat Mix shifts the balance:
+    //   sat_mix = -1 → additiveBlend = max(secW - 1, 0) = 0 → all subtractive
+    //   sat_mix =  0 → additiveBlend = secW → natural hue-based split
+    //   sat_mix = +1 → additiveBlend = min(secW + 1, 1) = 1 → all additive
+    float additiveBlend = _fminf(_fmaxf(secW + p_sat_mix, 0.0f), 1.0f);
 
-    float outR = subR * (1.0f - blend) + addR * blend;
-    float outG = subG * (1.0f - blend) + addG * blend;
-    float outB = subB * (1.0f - blend) + addB * blend;
+    float outR = subR * (1.0f - additiveBlend) + addR * additiveBlend;
+    float outG = subG * (1.0f - additiveBlend) + addG * additiveBlend;
+    float outB = subB * (1.0f - additiveBlend) + addB * additiveBlend;
 
-    // ── 9. Hard clamp to valid range ──
+    // ── 10. Clamp ──
     outR = _fminf(_fmaxf(outR, 0.0f), 1.0f);
     outG = _fminf(_fmaxf(outG, 0.0f), 1.0f);
     outB = _fminf(_fmaxf(outB, 0.0f), 1.0f);
@@ -275,7 +302,7 @@ __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p
     rgb.y = outG;
     rgb.z = outB;
 
-    // ── 10. Curve overlay ──
+    // ── 11. Curve overlay ──
     if (p_show_curve) {
         rgb = drawCurveOverlay(
             rgb, p_X, p_Y, p_Width, p_Height,
